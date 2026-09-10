@@ -1,0 +1,37 @@
+{
+  "objects": [
+    {
+      "id": "object_01",
+      "type": "box",
+      "position": {
+        "x": 2,
+        "y": 0,
+        "z": 3
+      },
+      "dimensions": {
+        "width": 2,
+        "height": 1,
+        "depth": 3
+      },
+      "rotation": {
+        "x": 0,
+        "y": 45,
+        "z": 0
+    }
+    },
+    {
+      "id": "object_02",
+      "type": "box",
+      "position": {
+        "x": -2,
+        "y": 0,
+        "z": 1
+      },
+      "dimensions": {
+        "width": 1,
+        "height": 2,
+        "depth": 1
+      }
+    }
+  ]
+}
