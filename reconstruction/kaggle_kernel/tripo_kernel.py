@@ -12,6 +12,7 @@ Pipeline:
 import os
 import sys
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -20,14 +21,15 @@ from pathlib import Path
 # ==============================================================================
 INPUT_IMAGE = "/kaggle/input/vinyasa-object-crops/sofa.png"
 OBJECT_ID = "sofa"
-TARGET_WIDTH = 2.8                          # real-world width (x-axis) in Three.js scene units
-POSITION = {"x": 0, "y": 0, "z": -0.6}
-ROTATION_Y = 180                            # degrees, or None to omit rotation
+TARGET_WIDTH = 1.2
+POSITION = {"x": 0, "y": 0, "z": -1.0}
+ROTATION_Y = 90
 MODEL_REL_PATH = f"public/model/{OBJECT_ID}.glb"
 
 WORK_DIR = Path("/kaggle/working")
-TRIPOSR_DIR = WORK_DIR / "TripoSR"
-MCUBES_DIR = WORK_DIR / "torchmcubes"
+TEMP_DIR = Path("/tmp")
+TRIPOSR_DIR = TEMP_DIR / "TripoSR"
+MCUBES_DIR = TEMP_DIR / "torchmcubes"
 
 
 def run(cmd: str):
@@ -80,21 +82,74 @@ def resolve_input_image(target_path: str, object_id: str) -> Path:
     )
 
 
+def patch_bake_texture_device_bug():
+    """Fix an unmerged upstream bug: bake_texture.py's positions_to_colors
+    builds the 'positions' tensor with no device (defaults to CPU), so on a
+    GPU kernel it stays on CPU while query_triplane's grid_sample runs on
+    CUDA, raising a device-mismatch RuntimeError. Also patches the resulting
+    queried_grid["color"].numpy() call, which would otherwise fail once that
+    tensor is on CUDA (numpy() requires a CPU tensor).
+    """
+    bake_path = TRIPOSR_DIR / "tsr" / "bake_texture.py"
+    if not bake_path.exists():
+        print(f"[PATCH] {bake_path} not found, skipping")
+        return
+
+    text = bake_path.read_text()
+    if "device=scene_code.device" in text:
+        print("[PATCH] bake_texture.py already patched, skipping")
+        return
+
+    old_positions_line = "positions = torch.tensor(positions_texture.reshape(-1, 4)[:, :-1])"
+    new_positions_line = (
+        "positions = torch.tensor(positions_texture.reshape(-1, 4)[:, :-1], "
+        "dtype=torch.float32, device=scene_code.device)"
+    )
+    old_color_line = 'rgb_f = queried_grid["color"].numpy().reshape(-1, 3)'
+    new_color_line = 'rgb_f = queried_grid["color"].cpu().numpy().reshape(-1, 3)'
+
+    if old_positions_line not in text:
+        print("[PATCH] bake_texture.py: expected positions line not found, skipping "
+              "(upstream code may have changed \u2014 check manually if the device error recurs)")
+        return
+
+    text = text.replace(old_positions_line, new_positions_line, 1)
+
+    if old_color_line in text:
+        text = text.replace(old_color_line, new_color_line, 1)
+    else:
+        print("[PATCH] bake_texture.py: color .numpy() line not found in expected "
+              "form \u2014 positions patched, but check for a CUDA .numpy() crash downstream")
+
+    bake_path.write_text(text)
+    print("[PATCH] bake_texture.py: pinned positions tensor to scene_code.device "
+          "and moved color tensor to CPU before .numpy()")
+
+
 def setup_triposr():
     if not TRIPOSR_DIR.exists():
         run(f"git clone https://github.com/VAST-AI-Research/TripoSR.git {TRIPOSR_DIR}")
 
+    # xvfb gives moderngl a virtual X display so bake_texture's
+    # moderngl.create_context(standalone=True) doesn't fail with
+    # "XOpenDisplay: cannot open display" on Kaggle's headless kernel
+    run("apt-get update -y -q")
+    run("apt-get install -y -q xvfb")
+
     # Build tools for torchmcubes
     run("pip install -q scikit-build-core cmake ninja pybind11")
 
-    # Minimal headless dependencies without pulling in heavy web UIs (gradio)
-    # or downgrading numpy/transformers
-    run("pip install -q trimesh omegaconf einops rembg pygltflib xatlas")
+    # Minimal headless dependencies with onnxruntime for rembg and moderngl for texture baking
+    run('pip install -q trimesh omegaconf einops "rembg[cpu]" onnxruntime pygltflib xatlas moderngl')
 
     # Patch pymatting import conflict if needed
-    pymatting_init = Path("/usr/local/lib/python3.12/dist-packages/pymatting/foreground/__init__.py")
-    if pymatting_init.exists():
-        run(f"sed -i '/estimate_foreground_ml_cupy/d' {pymatting_init}")
+    run("python -c \"import pymatting, pathlib; p = pathlib.Path(pymatting.__file__).parent / 'foreground' / '__init__.py'; [p.write_text('\\n'.join(l for l in p.read_text().splitlines() if 'estimate_foreground_ml_cupy' not in l) + '\\n') if p.exists() else None]\"")
+
+    # Patch known TripoSR bug: bake_texture builds the positions tensor without
+    # pinning it to scene_code's device, so on GPU it stays on CPU while
+    # query_triplane's grid_sample runs on CUDA -> "different device" RuntimeError.
+    # Unmerged upstream fix: https://github.com/VAST-AI-Research/TripoSR/pull/137
+    patch_bake_texture_device_bug()
 
     # Build and install patched torchmcubes
     if MCUBES_DIR.exists():
@@ -107,7 +162,7 @@ def setup_triposr():
 def run_triposr(image_path: Path) -> Path:
     out_dir = WORK_DIR / "tripo_output"
     run(
-        f'python {TRIPOSR_DIR}/run.py "{image_path}" '
+        f'xvfb-run -a python {TRIPOSR_DIR}/run.py "{image_path}" '
         f'--output-dir {out_dir}/ --bake-texture --render'
     )
     mesh_path = out_dir / "0" / "mesh.obj"
@@ -147,7 +202,7 @@ def normalize(scene, target_width: float) -> dict:
         "width": round(float(final_size[0]), 4),
         "height": round(float(final_size[1]), 4),
         "depth": round(float(final_size[2]), 4),
-    }
+   }
 
 
 def convert_to_glb(obj_path: Path, out_path: Path, target_width: float) -> dict:
@@ -165,7 +220,7 @@ def build_scene_entry(obj_id, model_rel_path, dimensions, position, rotation_y):
         "model": model_rel_path,
         "position": position,
         "dimensions": dimensions,
-    }
+   }
     if rotation_y is not None:
         entry["rotation"] = {"x": 0, "y": rotation_y, "z": 0}
     return entry

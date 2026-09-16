@@ -1,0 +1,29 @@
+# Ignore uploaded input files
+input/*
+!input/.gitkeep
+!input/dataset-metadata.json
+
+# Ignore generated output files
+output/*
+!output/.gitkeep
+
+# Ignore generated 3D and media files
+*.glb
+*.obj
+*.mtl
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+
+# Kaggle logs
+kaggle_kernel/kernel_log/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment files
+.env
+.env.*
