@@ -1,12 +1,16 @@
 """
 tripo_kernel.py — runs on Kaggle (GPU kernel).
 
-Pipeline:
-  1. Validate input image immediately before downloading or compiling anything.
-  2. Set up TripoSR + patched torchmcubes (fast minimal dependencies).
-  3. Run TripoSR on the object crop image.
-  4. Convert mesh.obj -> normalized .glb (scale to target width, floor-align, recenter).
-  5. Write the .glb + scene.json entry snippet to /kaggle/working.
+Batch pipeline:
+  1. Discover all object crop images in /kaggle/input (one dataset version
+     can now hold multiple objects, not just "sofa.png").
+  2. Set up TripoSR + patched torchmcubes ONCE for the whole kernel run.
+  3. For each object image:
+       a. Run TripoSR reconstruction.
+       b. Convert mesh.obj -> normalized .glb (scale, floor-align, recenter).
+       c. Write <object_id>.glb + scene_entry_<object_id>.json to /kaggle/working.
+     A failure on one object is logged and skipped — it does not abort
+     the rest of the batch.
 """
 
 import os
@@ -16,20 +20,28 @@ import re
 import subprocess
 from pathlib import Path
 
-# ==============================================================================
-# CONFIG — edit these per object/run
-# ==============================================================================
-INPUT_IMAGE = "/kaggle/input/vinyasa-object-crops/sofa.png"
-OBJECT_ID = "sofa"
-TARGET_WIDTH = 1.2
-POSITION = {"x": 0, "y": 0, "z": -1.0}
-ROTATION_Y = 90
-MODEL_REL_PATH = f"public/model/{OBJECT_ID}.glb"
 
+# ============================================================
+# CONFIG — edit per project/dataset layout
+# ============================================================
+INPUT_DIR = Path("/kaggle/input/vinyasa-object-crops")
 WORK_DIR = Path("/kaggle/working")
 TEMP_DIR = Path("/tmp")
 TRIPOSR_DIR = TEMP_DIR / "TripoSR"
 MCUBES_DIR = TEMP_DIR / "torchmcubes"
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+# Optional manifest produced by Part 1: maps object_id -> per-object
+# placement metadata. If absent, or an object_id is missing from it,
+# the DEFAULT_* values below are used instead, so a batch run never
+# fails just because placement data isn't ready yet.
+MANIFEST_FILENAME = "object_manifest.json"
+
+DEFAULT_TARGET_WIDTH = 1.2
+DEFAULT_POSITION = {"x": 0, "y": 0, "z": 0}
+DEFAULT_ROTATION_Y = 0
+MODEL_REL_PATH_TEMPLATE = "/model/{object_id}.glb"
 
 
 def run(cmd: str):
@@ -43,17 +55,19 @@ def run(cmd: str):
         raise subprocess.CalledProcessError(result.returncode, cmd)
 
 
-def resolve_input_image(target_path: str, object_id: str) -> Path:
-    """Check if the image exists. If not, scan /kaggle/input and auto-discover."""
-    path = Path(target_path)
-    if path.is_file():
-        return path
+def discover_input_images() -> list[Path]:
+    """
+    Find every object crop image under /kaggle/input.
 
-    print(f"\n[WARNING] Specified path '{target_path}' not found. Scanning /kaggle/input ...")
-    input_dir = Path("/kaggle/input")
-    all_files = list(input_dir.rglob("*")) if input_dir.exists() else []
-
+    Replaces the old single-file resolve_input_image(): instead of
+    looking for one hardcoded filename, this scans the whole mounted
+    dataset and processes every image found, so Part 1 can push any
+    number of cropped objects in one dataset version.
+    """
+    search_dir = INPUT_DIR if INPUT_DIR.exists() else Path("/kaggle/input")
+    all_files = list(search_dir.rglob("*")) if search_dir.exists() else []
     file_paths = [p for p in all_files if p.is_file()]
+
     if not file_paths:
         raise FileNotFoundError(
             "\n[FATAL] /kaggle/input is completely empty!\n"
@@ -64,22 +78,53 @@ def resolve_input_image(target_path: str, object_id: str) -> Path:
     print("=== Found files in /kaggle/input ===")
     for f in file_paths:
         print(f"  {f}")
-    print("====================================")
+    print("=" * 40)
 
-    # Attempt to auto-locate matching object image
-    candidates = [
-        f for f in file_paths
-        if f.stem.lower() == object_id.lower() and f.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"]
-    ]
-    if candidates:
-        selected = candidates[0]
-        print(f"[AUTO-RESOLVED] Using detected file: {selected}\n")
-        return selected
-
-    raise FileNotFoundError(
-        f"Could not find an image for '{object_id}' in /kaggle/input. "
-        f"Available files listed above."
+    images = sorted(
+        p for p in file_paths if p.suffix.lower() in IMAGE_EXTENSIONS
     )
+
+    if not images:
+        raise FileNotFoundError(
+            f"No object crop images (extensions {IMAGE_EXTENSIONS}) found "
+            f"under {search_dir}. Files present are listed above."
+        )
+
+    print(f"\n[DISCOVERY] {len(images)} object image(s) to process:")
+    for img in images:
+        print(f"  - {img.stem}  ({img})")
+
+    return images
+
+
+def load_manifest() -> dict:
+    """
+    Load the optional per-object placement manifest, if Part 1 provided one.
+
+    Expected shape:
+        {
+          "sofa":     {"target_width": 1.2, "position": {"x":0,"y":0,"z":-1}, "rotation_y": 90},
+          "chair_01": {"target_width": 0.5, "position": {"x":1,"y":0,"z":0.5}, "rotation_y": 0}
+        }
+
+    A missing file, or a missing object_id within it, falls back to
+    DEFAULT_* above.
+    """
+    search_dir = INPUT_DIR if INPUT_DIR.exists() else Path("/kaggle/input")
+    candidates = list(search_dir.rglob(MANIFEST_FILENAME)) if search_dir.exists() else []
+
+    if not candidates:
+        print(f"[MANIFEST] No {MANIFEST_FILENAME} found — using defaults for all objects.")
+        return {}
+
+    manifest_path = candidates[0]
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        print(f"[MANIFEST] Loaded {manifest_path} with {len(manifest)} object entr(y/ies).")
+        return manifest
+    except Exception as e:
+        print(f"[MANIFEST] Failed to parse {manifest_path}: {e} — using defaults for all objects.")
+        return {}
 
 
 def patch_bake_texture_device_bug():
@@ -110,7 +155,7 @@ def patch_bake_texture_device_bug():
 
     if old_positions_line not in text:
         print("[PATCH] bake_texture.py: expected positions line not found, skipping "
-              "(upstream code may have changed \u2014 check manually if the device error recurs)")
+              "(upstream code may have changed — check manually if the device error recurs)")
         return
 
     text = text.replace(old_positions_line, new_positions_line, 1)
@@ -119,7 +164,7 @@ def patch_bake_texture_device_bug():
         text = text.replace(old_color_line, new_color_line, 1)
     else:
         print("[PATCH] bake_texture.py: color .numpy() line not found in expected "
-              "form \u2014 positions patched, but check for a CUDA .numpy() crash downstream")
+              "form — positions patched, but check for a CUDA .numpy() crash downstream")
 
     bake_path.write_text(text)
     print("[PATCH] bake_texture.py: pinned positions tensor to scene_code.device "
@@ -129,6 +174,7 @@ def patch_bake_texture_device_bug():
 def setup_triposr():
     if not TRIPOSR_DIR.exists():
         run(f"git clone https://github.com/VAST-AI-Research/TripoSR.git {TRIPOSR_DIR}")
+        run(f"cat {TRIPOSR_DIR}/run.py")
 
     # xvfb gives moderngl a virtual X display so bake_texture's
     # moderngl.create_context(standalone=True) doesn't fail with
@@ -159,11 +205,14 @@ def setup_triposr():
     run(f"pip install -q --no-build-isolation --no-cache-dir {MCUBES_DIR}")
 
 
-def run_triposr(image_path: Path) -> Path:
-    out_dir = WORK_DIR / "tripo_output"
+def run_triposr(image_path: Path, object_id: str) -> Path:
+    # Namespaced by object_id so concurrent objects in the same batch
+    # never collide on TripoSR's own "0/mesh.obj" output convention.
+    out_dir = WORK_DIR / "tripo_output" / object_id
     run(
         f'xvfb-run -a python {TRIPOSR_DIR}/run.py "{image_path}" '
-        f'--output-dir {out_dir}/ --bake-texture --render'
+        f'--output-dir {out_dir}/ --bake-texture --render '
+        f'--mc-resolution 320'
     )
     mesh_path = out_dir / "0" / "mesh.obj"
     if not mesh_path.exists():
@@ -172,11 +221,33 @@ def run_triposr(image_path: Path) -> Path:
 
 
 def load_as_scene(obj_path: Path):
+    """Load TripoSR's OBJ (which has UVs but no .mtl) and manually
+    attach the adjacent texture.png using those UVs.
+
+    Uses an explicit non-metallic PBR material: glTF defaults metallicFactor
+    to 1.0 when unset, which renders dark without an env map and washed out
+    in viewers that have one."""
     import trimesh
-    loaded = trimesh.load(obj_path, force="scene", process=False)
-    if isinstance(loaded, trimesh.Trimesh):
-        loaded = trimesh.Scene(loaded)
-    return loaded
+    from trimesh.visual.material import PBRMaterial
+    from PIL import Image
+    mesh = trimesh.load(obj_path, process=False, force="mesh")
+
+    texture_path = obj_path.parent / "texture.png"
+    uv = getattr(mesh.visual, "uv", None)
+
+    if texture_path.exists() and uv is not None:
+        image = Image.open(texture_path)
+        material = PBRMaterial(
+            baseColorTexture=image,
+            metallicFactor=0.0,
+            roughnessFactor=1.0,
+        )
+        mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
+        print(f"[TEXTURE] Attached {texture_path.name} using {len(uv)} UVs (metallic=0, roughness=1)")
+    else:
+        print(f"[WARN] No texture.png or no UVs found next to {obj_path} — exporting untextured")
+
+    return trimesh.Scene(mesh)
 
 
 def normalize(scene, target_width: float) -> dict:
@@ -202,7 +273,7 @@ def normalize(scene, target_width: float) -> dict:
         "width": round(float(final_size[0]), 4),
         "height": round(float(final_size[1]), 4),
         "depth": round(float(final_size[2]), 4),
-   }
+    }
 
 
 def convert_to_glb(obj_path: Path, out_path: Path, target_width: float) -> dict:
@@ -220,35 +291,77 @@ def build_scene_entry(obj_id, model_rel_path, dimensions, position, rotation_y):
         "model": model_rel_path,
         "position": position,
         "dimensions": dimensions,
-   }
+    }
     if rotation_y is not None:
         entry["rotation"] = {"x": 0, "y": rotation_y, "z": 0}
     return entry
 
 
-def main():
-    # 1. FAST FAIL: Validate image path before running any heavy setups
-    image_path = resolve_input_image(INPUT_IMAGE, OBJECT_ID)
+def process_object(image_path: Path, manifest: dict) -> dict:
+    """Runs the full single-object pipeline (old steps 3-5) for one image.
+    Raises on failure — main() decides whether to skip and continue."""
+    object_id = image_path.stem
+    object_config = manifest.get(object_id, {})
 
-    # 2. Setup dependencies and model repo
-    setup_triposr()
+    target_width = object_config.get("target_width", DEFAULT_TARGET_WIDTH)
+    position = object_config.get("position", DEFAULT_POSITION)
+    rotation_y = object_config.get("rotation_y", DEFAULT_ROTATION_Y)
+    model_rel_path = MODEL_REL_PATH_TEMPLATE.format(object_id=object_id)
 
-    # 3. Inference
-    mesh_path = run_triposr(image_path)
+    print(f"\n--- Processing '{object_id}' ({image_path.name}) ---")
+    print(f"    target_width={target_width} position={position} rotation_y={rotation_y}")
 
-    # 4. Post-processing to GLB
-    glb_path = WORK_DIR / f"{OBJECT_ID}.glb"
-    dimensions = convert_to_glb(mesh_path, glb_path, TARGET_WIDTH)
+    mesh_path = run_triposr(image_path, object_id)
+    
+    obj_text = mesh_path.read_text()
+    prefix_counts = {}
+    for line in obj_text.splitlines():
+        prefix = line.split()[0] if line.split() else ""
+        prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+    print(f"[DEBUG] mesh.obj line prefix counts: {prefix_counts}")
+    print(f"[DEBUG] total lines: {sum(prefix_counts.values())}")        
 
-    # 5. Scene metadata JSON
-    entry = build_scene_entry(OBJECT_ID, MODEL_REL_PATH, dimensions, POSITION, ROTATION_Y)
-    entry_path = WORK_DIR / f"scene_entry_{OBJECT_ID}.json"
+    glb_path = WORK_DIR / f"{object_id}.glb"
+    dimensions = convert_to_glb(mesh_path, glb_path, target_width)
+
+    entry = build_scene_entry(object_id, model_rel_path, dimensions, position, rotation_y)
+    entry_path = WORK_DIR / f"scene_entry_{object_id}.json"
     entry_path.write_text(json.dumps(entry, indent=2))
 
-    print("\n=== DONE ===")
     print(f"GLB written to: {glb_path}")
     print(f"Scene entry written to: {entry_path}")
     print(json.dumps(entry, indent=2))
+
+    return entry
+
+
+def main():
+    # 1. FAST FAIL: discover every object image before running any heavy setup
+    images = discover_input_images()
+    manifest = load_manifest()
+
+    # 2. Setup dependencies and model repo — ONCE for the whole batch
+    setup_triposr()
+
+    # 3-5. Per-object: inference -> GLB -> scene entry.
+    # A failure on one object is logged and skipped, not fatal to the batch.
+    succeeded, failed = [], []
+    for image_path in images:
+        object_id = image_path.stem
+        try:
+            process_object(image_path, manifest)
+            succeeded.append(object_id)
+        except Exception as e:
+            print(f"[FAILED] {object_id}: {e}", flush=True)
+            failed.append(object_id)
+            continue
+
+    print("\n=== BATCH DONE ===")
+    print(f"Succeeded ({len(succeeded)}): {succeeded}")
+    print(f"Failed    ({len(failed)}): {failed}")
+
+    if not succeeded:
+        raise RuntimeError("All objects in the batch failed — see logs above.")
 
 
 if __name__ == "__main__":

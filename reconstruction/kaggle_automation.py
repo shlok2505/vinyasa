@@ -1,4 +1,3 @@
-
 """
 Vinyasa Kaggle TripoSR Automation
 
@@ -14,7 +13,10 @@ Existing Kaggle resources:
     Dataset: shrishlok/vinyasa-object-crops
     Kernel:  shrishlok/vinyasa-triposr-object-gen
 
-This version preserves the existing TripoSR kernel.
+Batch version: kernel now processes every object image found in the
+input dataset (plus an optional object_manifest.json for placement),
+so this driver retrieves ALL generated GLBs/scene entries, keyed by
+object id, instead of assuming a single "sofa.png" -> one GLB.
 """
 
 from __future__ import annotations
@@ -25,16 +27,10 @@ from pathlib import Path
 from typing import Optional
 
 if sys.stdout is not None:
-    sys.stdout.reconfigure(
-        encoding="utf-8",
-        errors="replace",
-    )
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 if sys.stderr is not None:
-    sys.stderr.reconfigure(
-        encoding="utf-8",
-        errors="replace",
-    )
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ============================================================
 # CONFIGURATION
@@ -49,9 +45,6 @@ OUTPUT_DIR = PROJECT_DIR / "output"
 DATASET_REF = "shrishlok/vinyasa-object-crops"
 KERNEL_REF = "shrishlok/vinyasa-triposr-object-gen"
 
-# Your current TripoSR kernel expects this filename.
-INPUT_FILENAME = "sofa.png"
-
 # Polling configuration.
 POLL_INTERVAL = 15
 TIMEOUT_SECONDS = 1800
@@ -61,10 +54,7 @@ TIMEOUT_SECONDS = 1800
 # KAGGLE CLI HELPER
 # ============================================================
 
-def run_kaggle(
-    command: list[str],
-    cwd: Path,
-) -> str:
+def run_kaggle(command: list[str], cwd: Path) -> str:
     """
     Execute a Kaggle CLI command.
 
@@ -85,8 +75,11 @@ def run_kaggle(
 
     print("Directory:", cwd)
     print("Command:", " ".join(command))
+    import os
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
 
-    
     result = subprocess.run(
         command,
         cwd=str(cwd),
@@ -94,6 +87,7 @@ def run_kaggle(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
 
     if result.stdout:
@@ -158,7 +152,7 @@ def push_input_dataset() -> str:
 # ============================================================
 
 def update_input_dataset(
-    message: str = "Update Vinyasa object crop",
+    message: str = "Update Vinyasa object crops",
 ) -> str:
     """
     Create a new version of the existing Kaggle dataset.
@@ -341,7 +335,6 @@ def wait_for_completion() -> str:
 # 7. RETRIEVE KAGGLE OUTPUT
 # ============================================================
 
-
 def retrieve_output() -> Path:
     """
     Download Kaggle output and delete unnecessary files.
@@ -424,62 +417,72 @@ def retrieve_output() -> Path:
 
     return OUTPUT_DIR
 
+
 # ============================================================
-# 8. FIND GENERATED GLB
+# 8. FIND GENERATED GLBs / SCENE ENTRIES (batch-aware)
 # ============================================================
 
-def find_generated_glb() -> Optional[Path]:
+def find_generated_glbs() -> dict[str, Path]:
     """
-    Find the generated GLB in output/.
+    Find all generated GLBs in output/, keyed by object id.
 
-    Your tripo_kernel.py writes:
-        /kaggle/working/sofa.glb
-
-    Kaggle output retrieval should place it in:
-        reconstruction/output/
+    tripo_kernel.py now writes one GLB per source image, named
+    after the image's stem (e.g. sofa.glb, chair.glb).
     """
 
     if not OUTPUT_DIR.exists():
-        return None
+        return {}
 
-    glb_files = list(
-        OUTPUT_DIR.rglob("*.glb")
-    )
+    return {
+        glb_path.stem: glb_path
+        for glb_path in OUTPUT_DIR.rglob("*.glb")
+    }
 
-    if not glb_files:
-        return None
 
-    # Most recently modified GLB.
-    return max(
-        glb_files,
-        key=lambda path: path.stat().st_mtime,
-    )
+def find_scene_entries() -> dict[str, Path]:
+    """
+    Find all scene_entry_*.json files in output/, keyed by object id.
+    """
+
+    if not OUTPUT_DIR.exists():
+        return {}
+
+    entries: dict[str, Path] = {}
+
+    for json_path in OUTPUT_DIR.rglob("scene_entry_*.json"):
+        object_id = json_path.stem.removeprefix("scene_entry_")
+        entries[object_id] = json_path
+
+    return entries
 
 
 # ============================================================
 # 9. COMPLETE PIPELINE
 # ============================================================
 
-def generate_3d_model(
+def generate_3d_models(
     update_dataset: bool = False,
-    dataset_message: str = "Generate Vinyasa object",
-) -> str:
+    dataset_message: str = "Update Vinyasa object crops",
+) -> dict:
     """
-    Execute the full Kaggle TripoSR pipeline.
+    Execute the full Kaggle TripoSR batch pipeline.
 
     Current workflow:
-        1. Optionally update dataset
+        1. Optionally update dataset (push new crops + manifest)
         2. Push kernel
         3. Wait for completion
         4. Retrieve output
-        5. Find GLB
+        5. Find all GLBs + scene entries, keyed by object id
 
     Returns:
-        Absolute path to generated GLB.
+        {
+          "glbs": {object_id: Path, ...},
+          "scene_entries": {object_id: Path, ...},
+        }
     """
 
     print("\n" + "=" * 60)
-    print("VINYASA TRIPOSR PIPELINE STARTED")
+    print("VINYASA TRIPOSR BATCH PIPELINE STARTED")
     print("=" * 60)
 
     # --------------------------------------------------------
@@ -523,27 +526,39 @@ def generate_3d_model(
     retrieve_output()
 
     # --------------------------------------------------------
-    # STEP 5: FIND GLB
+    # STEP 5: FIND GLBs + SCENE ENTRIES
     # --------------------------------------------------------
 
-    print("\n[5/5] Searching for generated GLB...")
+    print("\n[5/5] Searching for generated GLBs and scene entries...")
 
-    glb_path = find_generated_glb()
+    glb_paths = find_generated_glbs()
+    scene_entries = find_scene_entries()
 
-    if glb_path is None:
+    if not glb_paths:
         raise FileNotFoundError(
-            "Kaggle completed, but no .glb file was found "
+            "Kaggle completed, but no .glb files were found "
             f"in {OUTPUT_DIR}."
         )
 
+    missing_entries = set(glb_paths) - set(scene_entries)
+    if missing_entries:
+        print(
+            f"[WARNING] {len(missing_entries)} object(s) have a GLB "
+            f"but no scene_entry JSON: {sorted(missing_entries)}"
+        )
+
     print("\n" + "=" * 60)
-    print("VINYASA TRIPOSR PIPELINE COMPLETE")
+    print("VINYASA TRIPOSR BATCH PIPELINE COMPLETE")
     print("=" * 60)
 
-    print("Generated GLB:")
-    print(glb_path)
+    print(f"Generated {len(glb_paths)} object(s):")
+    for object_id, glb_path in glb_paths.items():
+        print(f"  - {object_id}: {glb_path}")
 
-    return str(glb_path)
+    return {
+        "glbs": glb_paths,
+        "scene_entries": scene_entries,
+    }
 
 
 # ============================================================
@@ -552,11 +567,26 @@ def generate_3d_model(
 
 if __name__ == "__main__":
 
-    # First test:
-    # Use the existing dataset containing sofa.png.
-    model_path = generate_3d_model(
-        update_dataset=False,
+    # Manifest test run:
+    # input/ now has sofa.png, chair.jpg, and object_manifest.json.
+    # update_dataset=True so Kaggle actually receives the new files
+    # before the kernel runs — without this, it'll reuse the last
+    # pushed dataset version and never see chair.jpg or the manifest.
+    result = generate_3d_models(
+        update_dataset=True,
+        dataset_message="Add chair crop + object_manifest.json for batch test",
     )
 
-    print("\nFINAL MODEL PATH:")
-    print(model_path)
+    print("\nFINAL RESULTS:")
+    print("GLBs:", result["glbs"])
+    print("Scene entries:", result["scene_entries"])
+
+    import importlib.util
+
+    merge_scene_path = PROJECT_DIR / "script" / "merge_scene.py"
+    spec = importlib.util.spec_from_file_location("merge_scene", merge_scene_path)
+    merge_scene_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(merge_scene_module)
+
+    print("\nMerging scene entries into rendering/src/data/scene.json...")
+    merge_scene_module.merge_scene()
